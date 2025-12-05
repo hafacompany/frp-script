@@ -8,6 +8,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Script installation path
+INSTALL_PATH="/usr/local/bin/frp-manager"
+SCRIPT_PATH="$(readlink -f "$0")"
+
 # Helper functions
 print_header() {
     echo -e "${BLUE}=================================${NC}"
@@ -32,37 +36,151 @@ print_error() {
     echo -e "${RED}[✗] $1${NC}"
 }
 
-# Cron for Garbage Collection / doesnt terminate process just triggers Garbage Collection and Ensuring BBR and FQ are Enabled 
+# Cron for Garbage Collection / doesnt terminate process just triggers Garbage Collection and Ensuring BBR and FQ are Enabled
 optimize() {
     local -r cron_job="0 */3 * * * pkill -10 -x frpc; pkill -10 -x frps"
     local -r sysctl_conf="/etc/sysctl.conf"
     local -r bbr_module="/etc/modules-load.d/bbr.conf"
-    
+
     # Ensure cron job exists (idempotent)
     sudo crontab -l 2>/dev/null | grep -Fq "${cron_job}" || {
         (sudo crontab -l 2>/dev/null; echo "${cron_job}") | sudo crontab -
     }
-    
+
     # Configure BBR if not already optimal
-    [[ "$(sysctl -n net.core.default_qdisc)" == "fq" && 
+    [[ "$(sysctl -n net.core.default_qdisc)" == "fq" &&
        "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] && return
-    
+
     # Apply BBR configuration atomically
     {
         echo "net.core.default_qdisc=fq"
         echo "net.ipv4.tcp_congestion_control=bbr"
     } | sudo tee -a "${sysctl_conf}" >/dev/null
-    
+
     echo "tcp_bbr" | sudo tee "${bbr_module}" >/dev/null
-    
+
     sudo modprobe tcp_bbr 2>/dev/null || true
     sudo sysctl -p >/dev/null
+}
+
+# Reduce I/O by disabling rsyslog and making journald volatile
+reduce_io() {
+    print_info "Reducing I/O by logging only to memory..."
+    sudo systemctl disable --now rsyslog && sudo sed -i 's/^#Storage=.*/Storage=volatile/' /etc/systemd/journald.conf && sudo systemctl restart systemd-journald
+    print_success "I/O reduced - logs are now stored in volatile memory."
+}
+
+# Remove all system logs
+remove_logs() {
+    print_warning "This will permanently delete all system logs!"
+    read -p "Are you sure you want to continue? (yes/no): " confirm
+
+    if [[ "$confirm" != "yes" ]]; then
+        print_info "Log removal cancelled."
+        return
+    fi
+
+    print_info "Removing all system logs..."
+
+    # Clear journal logs
+    sudo journalctl --vacuum-time=1s
+
+    # Remove log files in /var/log
+    sudo find /var/log -type f -name "*.log" -exec truncate -s 0 {} \; 2>/dev/null
+    sudo find /var/log -type f -name "*.log.*" -delete 2>/dev/null
+
+    # Remove other common log locations
+    sudo find /var/log -type f \( -name "*.gz" -o -name "*.1" -o -name "*.2" -o -name "*.3" -o -name "*.4" -o -name "*.5" -o -name "*.6" -o -name "*.7" -o -name "*.8" -o -name "*.9" \) -delete 2>/dev/null
+
+    # Clear wtmp and btmp logs
+    sudo truncate -s 0 /var/log/wtmp 2>/dev/null
+    sudo truncate -s 0 /var/log/btmp 2>/dev/null
+
+    print_success "All system logs have been removed."
+}
+
+# Utilities menu
+utilities_menu() {
+    while true; do
+        clear
+        print_header
+        echo "FRP Manager Utilities"
+        echo "---------------------"
+        echo
+        echo "1) Optimize System (BBR, FQ)"
+        echo "2) OS logs Only In Memory (Reduce disk I/O)"
+        echo "3) Remove All System logs (Clears Storage)"
+        echo "4) Back to Main Menu"
+        echo
+
+        read -p "Choose an option [1-4]: " util_choice
+        echo
+
+        case $util_choice in
+            1)
+                optimize
+                print_success "System optimization completed."
+                read -p "Press Enter to continue..."
+                ;;
+            2)
+                reduce_io
+                read -p "Press Enter to continue..."
+                ;;
+            3)
+                remove_logs
+                read -p "Press Enter to continue..."
+                ;;
+            4)
+                return
+                ;;
+            *)
+                print_error "Invalid option. Please choose 1-4."
+                read -p "Press Enter to continue..."
+                ;;
+        esac
+    done
+}
+
+# Self-install the script as a command
+install_script() {
+    if [[ "$SCRIPT_PATH" == "$INSTALL_PATH" ]]; then
+        print_info "Script is already installed as frp-manager command."
+        return
+    fi
+
+    print_info "Installing script as frp-manager command..."
+    sudo cp "$SCRIPT_PATH" "$INSTALL_PATH"
+    sudo chmod +x "$INSTALL_PATH"
+    print_success "Script installed as frp-manager. You can now run it by typing 'frp-manager' in terminal."
+}
+
+# Check if this is a fresh run and script isn't installed yet
+check_installation() {
+    if [[ "$SCRIPT_PATH" != "$INSTALL_PATH" ]]; then
+        print_header
+        echo "This script can be installed as a system command for easier access."
+        echo "After installation, you'll be able to run 'frp-manager' from anywhere."
+        echo
+        read -p "Would you like to install it now? (y/n) [y]: " install_choice
+
+        case $install_choice in
+            n|N)
+                print_info "Continuing without installation."
+                ;;
+            *)
+                install_script
+                ;;
+        esac
+
+        echo
+        read -p "Press Enter to continue..."
+    fi
 }
 
 # Install FRP
 install_frp() {
     print_info "Starting FRP installation..."
-    
+
     # Detect platform
     arch=$(uname -m)
     case "$arch" in
@@ -275,7 +393,7 @@ EOF
 
     service_name="${config_name%.toml}"
     systemctl enable --now "frpc@$service_name"
-    
+
     print_success "Client setup complete."
 }
 
@@ -295,7 +413,7 @@ advanced_config() {
                 print_warning "No server configurations found in /root/frp/server/"
                 return
             fi
-            
+
             print_info "Available server configurations:"
             echo
             configs=($(ls /root/frp/server/*.toml 2>/dev/null | xargs -n1 basename))
@@ -304,25 +422,25 @@ advanced_config() {
             done
             echo "$((${#configs[@]}+1))) Back"
             echo
-            
+
             read -p "Select configuration to edit [1-$((${#configs[@]}+1))]: " server_choice
-            
+
             if [[ $server_choice -eq $((${#configs[@]}+1)) ]]; then
                 return
             elif [[ $server_choice -ge 1 && $server_choice -le ${#configs[@]} ]]; then
                 selected_config="${configs[$((server_choice-1))]}"
                 config_path="/root/frp/server/$selected_config"
-                
+
                 print_info "Current configuration ($selected_config):"
                 echo "----------------------------------------"
                 cat "$config_path"
                 echo "----------------------------------------"
                 echo
-                
+
                 read -p "Edit this file? (y/n) [n]: " edit_choice
                 if [[ "$edit_choice" =~ ^[Yy]$ ]]; then
                     ${EDITOR:-nano} "$config_path"
-                    
+
                     # Restart service if it's running
                     service_name="${selected_config%.toml}"
                     if systemctl is-active --quiet "frps@$service_name"; then
@@ -338,7 +456,7 @@ advanced_config() {
                 print_warning "No client configurations found in /root/frp/client/"
                 return
             fi
-            
+
             print_info "Available client configurations:"
             echo
             configs=($(ls /root/frp/client/*.toml 2>/dev/null | xargs -n1 basename))
@@ -347,25 +465,25 @@ advanced_config() {
             done
             echo "$((${#configs[@]}+1))) Back"
             echo
-            
+
             read -p "Select configuration to edit [1-$((${#configs[@]}+1))]: " client_choice
-            
+
             if [[ $client_choice -eq $((${#configs[@]}+1)) ]]; then
                 return
             elif [[ $client_choice -ge 1 && $client_choice -le ${#configs[@]} ]]; then
                 selected_config="${configs[$((client_choice-1))]}"
                 config_path="/root/frp/client/$selected_config"
-                
+
                 print_info "Current configuration ($selected_config):"
                 echo "----------------------------------------"
                 cat "$config_path"
                 echo "----------------------------------------"
                 echo
-                
+
                 read -p "Edit this file? (y/n) [n]: " edit_choice
                 if [[ "$edit_choice" =~ ^[Yy]$ ]]; then
                     ${EDITOR:-nano} "$config_path"
-                    
+
                     # Restart service if it's running
                     service_name="${selected_config%.toml}"
                     if systemctl is-active --quiet "frpc@$service_name"; then
@@ -388,7 +506,7 @@ advanced_config() {
 # Stop services
 stop_services() {
     print_info "Stopping FRP services..."
-    
+
     # Stop all running frps services
     running_servers=$(systemctl list-units --type=service --state=running | grep "frps@" | awk '{print $1}' || true)
     if [[ -n "$running_servers" ]]; then
@@ -398,7 +516,7 @@ stop_services() {
             systemctl stop "$service"
         done
     fi
-    
+
     # Stop all running frpc services
     running_clients=$(systemctl list-units --type=service --state=running | grep "frpc@" | awk '{print $1}' || true)
     if [[ -n "$running_clients" ]]; then
@@ -408,7 +526,7 @@ stop_services() {
             systemctl stop "$service"
         done
     fi
-    
+
     print_success "All FRP services stopped."
 }
 
@@ -416,41 +534,41 @@ stop_services() {
 remove_frp() {
     print_warning "This will completely remove FRP and all configurations!"
     read -p "Are you sure? (yes/no): " confirm
-    
+
     if [[ "$confirm" != "yes" ]]; then
         print_info "Removal cancelled."
         return
     fi
-    
+
     print_info "Stopping all FRP services..."
     stop_services
-    
+
     print_info "Disabling and removing services..."
     # Disable and remove all frp services
     enabled_servers=$(systemctl list-unit-files | grep "frps@" | awk '{print $1}' || true)
     for service in $enabled_servers; do
         systemctl disable "$service" 2>/dev/null || true
     done
-    
+
     enabled_clients=$(systemctl list-unit-files | grep "frpc@" | awk '{print $1}' || true)
     for service in $enabled_clients; do
         systemctl disable "$service" 2>/dev/null || true
     done
-    
+
     print_info "Removing service files..."
     rm -f /etc/systemd/system/frps@.service
     rm -f /etc/systemd/system/frpc@.service
-    
+
     print_info "Removing binaries..."
     rm -f /usr/local/bin/frpc
     rm -f /usr/local/bin/frps
-    
+
     print_info "Removing configuration directories..."
     rm -rf /root/frp/
-    
+
     print_info "Reloading systemd..."
     systemctl daemon-reload
-    
+
     print_success "FRP completely removed from system."
 }
 
@@ -458,25 +576,25 @@ remove_frp() {
 show_status() {
     print_info "FRP Service Status"
     echo
-    
+
     # Check if binaries exist
     if [[ ! -f "/usr/local/bin/frpc" ]] || [[ ! -f "/usr/local/bin/frps" ]]; then
         print_warning "FRP is not installed."
         return
     fi
-    
+
     print_info "Installed FRP version:"
     /usr/local/bin/frps --version 2>/dev/null || echo "Unable to determine version"
     echo
-    
+
     print_info "Running services:"
     systemctl list-units --type=service --state=running | grep -E "frp[sc]@" || echo "No FRP services running"
     echo
-    
+
     print_info "Enabled services:"
     systemctl list-unit-files | grep -E "frp[sc]@.*enabled" || echo "No FRP services enabled"
     echo
-    
+
     print_info "Configuration files:"
     echo "Server configs:"
     ls -la /root/frp/server/ 2>/dev/null || echo "  No server configs found"
@@ -489,20 +607,21 @@ main_menu() {
     while true; do
         clear
         print_header
-        
+
         echo "1) Install FRP"
         echo "2) Setup FRP Server"
         echo "3) Setup FRP Client"
         echo "4) Advanced Configuration"
         echo "5) Show Status"
         echo "6) Stop All Services"
-        echo "7) Remove FRP"
-        echo "8) Exit"
+        echo "7) Utilities"
+        echo "8) Remove FRP"
+        echo "9) Exit"
         echo
-        
-        read -p "Choose an option [1-8]: " choice
+
+        read -p "Choose an option [1-9]: " choice
         echo
-        
+
         case $choice in
             1)
                 install_frp
@@ -529,15 +648,18 @@ main_menu() {
                 read -p "Press Enter to continue..."
                 ;;
             7)
+                utilities_menu
+                ;;
+            8)
                 remove_frp
                 read -p "Press Enter to continue..."
                 ;;
-            8)
+            9)
                 print_success "Goodbye!"
                 exit 0
                 ;;
             *)
-                print_error "Invalid option. Please choose 1-8."
+                print_error "Invalid option. Please choose 1-9."
                 read -p "Press Enter to continue..."
                 ;;
         esac
@@ -549,6 +671,9 @@ if [[ $EUID -ne 0 ]]; then
     print_error "This script must be run as root (use sudo)"
     exit 1
 fi
+
+# Check for first-time installation
+check_installation
 
 # Ensure optimization
 optimize
